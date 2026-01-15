@@ -48,7 +48,7 @@ class RMSNorm(nn.Module):
     def __init__(self, in_channels: int, eps: float = 1e-6):
         super().__init__()
         self.in_channels = in_channels
-        self.scale = nn.Parameter(torch.ones(in_channels))
+        self.scale = nn.Parameter(torch.ones(1, in_channels, 1, 1))
         self.eps = eps
 
     def forward(self, x: Tensor, time_emb= None) -> Tensor:
@@ -93,24 +93,33 @@ class Block(nn.Module):
 class ResBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int):
         super().__init__()
-        self.time_mlp = nn.Sequential(
+        self.time_mlp_in = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, in_channels * 2)
+        )
+        self.time_mlp_out = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_emb_dim, out_channels * 2)
         )
         self.block1 = Block(in_channels, out_channels)
         self.block2 = Block(out_channels, out_channels)
+
         if in_channels != out_channels:
             self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
             self.skip = nn.Identity()
 
     def forward(self, x: Tensor, time_emb: Tensor) -> Tensor:
-        time_emb = self.time_mlp(time_emb)
-        time_emb = rearrange(time_emb, 'b c -> b c 1 1')
-        scale, shift = time_emb.chunk(2, dim=1)
+        time_emb_in = self.time_mlp_in(time_emb)
+        time_emb_in = rearrange(time_emb_in, 'b c -> b c 1 1')
+        scale1, shift1 = time_emb_in.chunk(2, dim=1)
 
-        h = self.block1(x, scale, shift)
-        h = self.block2(h)
+        time_emb_out = self.time_mlp_out(time_emb)
+        time_emb_out = rearrange(time_emb_out, 'b c -> b c 1 1')
+        scale2, shift2 = time_emb_out.chunk(2, dim=1)
+
+        h = self.block1(x, scale1, shift1)
+        h = self.block2(h, scale2, shift2)
         return h + self.skip(x)
 
         
@@ -136,7 +145,7 @@ class CrossAttention(nn.Module):
 
         self.output = nn.Sequential(
             nn.Conv2d(hidden_dim, in_channels, kernel_size=1),
-            RMSNorm(in_channels, self.scale)
+            RMSNorm(in_channels)
         )
     
     def forward(self, x: Tensor, context: Tensor, time_emb: Tensor = None) -> Tensor:
@@ -259,11 +268,11 @@ class SelfAttention(nn.Module):
 class GEGLU(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self._to_x_gate= nn.Linear(in_channels, out_channels * 2)
+        self._to_x_gate= nn.Conv2d(in_channels, out_channels * 2, kernel_size=1)
 
     def forward(self, x: Tensor) -> Tensor:
         x_gate = self._to_x_gate(x)
-        x, gate = x_gate.chunk(2, dim=-1)
+        x, gate = x_gate.chunk(2, dim=1)
         return x * F.gelu(gate)
     
 class FeedForward(nn.Module):
@@ -273,7 +282,7 @@ class FeedForward(nn.Module):
         self.ff = nn.Sequential(
             #nn.Linear(in_channels, out_channels),
             GEGLU(in_channels, inner_dim),
-            nn.Linear(inner_dim, in_channels)
+            nn.Conv2d(inner_dim, in_channels, kernel_size=1)
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -318,21 +327,14 @@ class UNet(nn.Module):
             nn.Linear(time_emb_dim, time_emb_dim)
         )
 
-        self.input_layer = nn.Conv2d(in_channels, 64, kernel_size=1)
+        self.input_layer = nn.Conv2d(in_channels, 32, kernel_size=1)
 
         self.downs = nn.ModuleList([
             nn.ModuleList([
-                ResBlock(64, 64, time_emb_dim),
-                ResBlock(64, 64, time_emb_dim),
-                TransformerBlock(64, heads, dim_head, 128, time_emb_dim),
-                DownBlockStride(64, 64)
-            ]),
-
-            nn.ModuleList([
-                ResBlock(64, 64, time_emb_dim),
-                ResBlock(64, 64, time_emb_dim),
-                TransformerBlock(64, heads, dim_head, 128, time_emb_dim),
-                DownBlockStride(64, 64)
+                ResBlock(32, 32, time_emb_dim),
+                ResBlock(32, 32, time_emb_dim),
+                TransformerBlock(32, heads, dim_head, 128, time_emb_dim),
+                DownBlockStride(32, 64)
             ]),
 
             nn.ModuleList([
@@ -340,15 +342,29 @@ class UNet(nn.Module):
                 ResBlock(64, 64, time_emb_dim),
                 TransformerBlock(64, heads, dim_head, 128, time_emb_dim),
                 DownBlockStride(64, 128)
+            ]),
+
+            nn.ModuleList([
+                ResBlock(128, 128, time_emb_dim),
+                ResBlock(128, 128, time_emb_dim),
+                TransformerBlock(128, heads, dim_head, 128, time_emb_dim),
+                nn.Conv2d(128, 256, kernel_size=3, padding=1)
             ])
         ])
 
-        self.mid_block1 = ResBlock(128, 128, time_emb_dim)
-        self.mid_transform = TransformerBlock(128, heads, dim_head, 128, time_emb_dim)
+        self.mid_block1 = ResBlock(256, 256, time_emb_dim)
+        self.mid_transform = TransformerBlock(256, heads, dim_head, 128, time_emb_dim)
         #self.mid_attention = SelfAttention(128, heads, dim_head, time_emb_dim)
-        self.mid_block2 = ResBlock(128, 128, time_emb_dim)
+        self.mid_block2 = ResBlock(256, 256, time_emb_dim)
 
         self.ups = nn.ModuleList([
+            nn.ModuleList([
+                ResBlock(256 + 128, 256, time_emb_dim),
+                ResBlock(256 + 128, 256, time_emb_dim),
+                TransformerBlock(256, heads, dim_head, 128, time_emb_dim),
+                UpBlock(256, 128)
+            ]),
+
             nn.ModuleList([
                 ResBlock(128 + 64, 128, time_emb_dim),
                 ResBlock(128 + 64, 128, time_emb_dim),
@@ -360,14 +376,7 @@ class UNet(nn.Module):
                 ResBlock(64 + 32, 64, time_emb_dim),
                 ResBlock(64 + 32, 64, time_emb_dim),
                 TransformerBlock(64, heads, dim_head, 128, time_emb_dim),
-                UpBlock(64, 32)
-            ]),
-
-            nn.ModuleList([
-                ResBlock(32 + 32, 32, time_emb_dim),
-                ResBlock(32 + 32, 32, time_emb_dim),
-                TransformerBlock(32, heads, dim_head, 128, time_emb_dim),
-                nn.Conv2d(32, 32, kernel_size=3, padding=1)
+                nn.Conv2d(64, 32, kernel_size=3, padding=1)
             ])
         ])
 
@@ -385,21 +394,33 @@ class UNet(nn.Module):
 
         for res1, res2, transform, down in self.downs:
             y = res1(y, time_emb)
+            print("after res1: ", y.shape)
             residuals.append(y)
             y = res2(y, time_emb)
+            print("after res2: ", y.shape)
             y = transform(y, context, time_emb)
+            print("after transform: ", y.shape)
             residuals.append(y)
             y = down(y)
+            print("after down: ", y.shape)
 
         y = self.mid_block1(y, time_emb)
+        print("after mid block 1: ", y.shape)
         y = self.mid_transform(y, context, time_emb)
+        print("after mid transform: ", y.shape)
         y = self.mid_block2(y, time_emb)    
+        print("after mid block 2: ", y.shape)
 
         for res1, res2, transform, up in self.ups:
             y = res1(torch.cat((y, residuals.pop()), dim=1), time_emb)
+            print("after res1 up: ", y.shape)
             y = res2(torch.cat((y, residuals.pop()), dim=1), time_emb)
+            print("after res2 up: ", y.shape)
             y = transform(y, context, time_emb)
+            print("after transform up: ", y.shape)
             y = up(y)
+            print("after up: ", y.shape)
+            
 
         y = self.output_res(torch.cat((y, r), dim=1), time_emb)
         y = self.output_layer(y)
