@@ -3,7 +3,8 @@ from torch import Tensor, einsum
 import torch.nn as nn
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from conditioning import TimeEmbedding, ImageConditioning
+import torch.nn.functional as F
+from conditioning import TimeEmbedding
 
     
 class DownBlockLossless(nn.Module):
@@ -50,20 +51,20 @@ class RMSNorm(nn.Module):
         self.scale = nn.Parameter(torch.ones(in_channels))
         self.eps = eps
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, time_emb= None) -> Tensor:
         mean = torch.mean(x**2, dim=1, keepdim=True)
         inv_rms = torch.rsqrt(mean + self.eps)
         return x * inv_rms * self.scale
     
 class AdaRMSNorm(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int, eps: float = 1e-6):
+    def __init__(self, in_channels: int, time_emb_dim: int, eps: float = 1e-6):
         super().__init__()
         self.in_channels = in_channels
         self.time_emb_dim = time_emb_dim
         self.eps = eps
         self.mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_emb_dim, out_channels * 2)
+            nn.Linear(time_emb_dim, in_channels * 2)
         )
 
     def forward(self, x: Tensor, time_emb: Tensor) -> Tensor:
@@ -106,7 +107,7 @@ class ResBlock(nn.Module):
     def forward(self, x: Tensor, time_emb: Tensor) -> Tensor:
         time_emb = self.time_mlp(time_emb)
         time_emb = rearrange(time_emb, 'b c -> b c 1 1')
-        scale, shift = time_emb.chunk(2, dim=-1)
+        scale, shift = time_emb.chunk(2, dim=1)
 
         h = self.block1(x, scale, shift)
         h = self.block2(h)
@@ -124,33 +125,35 @@ class CrossAttention(nn.Module):
         self.scale = head_dim ** -0.5
         hidden_dim = heads * head_dim
 
-        if time_emb_dim is not None:
-            self.norm = AdaRMSNorm(in_channels, in_channels, time_emb_dim)
-        else:
-            self.norm = RMSNorm(in_channels, scale=1.0)
+        # if time_emb_dim is not None:
+        #     self.norm = AdaRMSNorm(in_channels, time_emb_dim)
+        # else:
+        #     self.norm = RMSNorm(in_channels, scale=1.0)
+
 
         self.q = nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False)
         self.to_kv = nn.Linear(context_dim, 2 * hidden_dim, bias=False)
 
         self.output = nn.Sequential(
             nn.Conv2d(hidden_dim, in_channels, kernel_size=1),
-            RMSNorm(in_channels, scale=1.0)
+            RMSNorm(in_channels, self.scale)
         )
     
-    def forward(self, x: Tensor, context: Tensor) -> Tensor:
+    def forward(self, x: Tensor, context: Tensor, time_emb: Tensor = None) -> Tensor:
         residual = x
         b, c, l, w = x.shape
-        q = self.q(self.norm(x))
-        kv = self.to_kv(self.norm(context))
+        q = self.q(x)
+        kv = self.to_kv(context)
         k, v = kv.chunk(2, dim=-1)
 
         q = rearrange(q, 'b (h c) l w -> b h c (l w)', h=self.heads)
-        k = rearrange(k, 'b (h c) l w -> b h c (l w)', h=self.heads)
-        v = rearrange(v, 'b (h c) l w -> b h c (l w)', h=self.heads)
+
+        k = rearrange(k, 'b s (h c) -> b h c s', h=self.heads)
+        v = rearrange(v, 'b s (h c) -> b h c s', h=self.heads)
 
         q = q * self.scale
 
-        attn = torch.einsum('b h c lw1, b h c lw2 -> b h lw1 lw2', q, k)
+        attn = torch.einsum('b h c i, b h c j -> b h i j', q, k)
         attn = torch.softmax(attn, dim=-1)
 
         sim = torch.einsum('b h c i, b h c j -> b h i j', q, k)
@@ -158,7 +161,7 @@ class CrossAttention(nn.Module):
         attn = sim.softmax(dim=-1)
 
         # (batch, heads, channels, length + width)
-        attn_output = torch.einsum('b h lw1 lw2, b h c lw2 -> b h lw1 c', attn, v)
+        attn_output = torch.einsum('b h i j, b h c j -> b h i c', attn, v)
         attn_output = rearrange(attn_output, 'b h (l w) c -> b (h c) l w', l=l, w=w)
         return self.output(attn_output) + residual
 
@@ -174,7 +177,7 @@ class LinearAttention(nn.Module):
         if time_emb_dim is not None:
             self.norm = AdaRMSNorm(in_channels, in_channels, time_emb_dim)
         else:
-            self.norm = RMSNorm(in_channels, scale=1.0)
+            self.norm = RMSNorm(in_channels)
         
         self.qkv = nn.Conv2d(in_channels, hidden_dim * 3, kernel_size=1, bias=False)
         self.output = nn.Sequential(
@@ -195,8 +198,8 @@ class LinearAttention(nn.Module):
         q = torch.softmax(q, dim=2) * self.scale
         k = torch.softmax(k, dim=3)
 
-        context = torch.einsum('b h c lw1, b h c lw2 -> b h lw1 lw2', k, v) * self.scale
-        out = torch.einsum('b h lw1 lw2, b h c lw -> b h lw2 lw', context, q)
+        context = torch.einsum('b h c i, b h c j -> b h i j', k, v) * self.scale
+        out = torch.einsum('b h i j, b h c i -> b h j c', context, q)
 
         attn_output = rearrange(out, 'b h c (l w) -> b (h c) l w', l=h, w=w)
         return self.output(attn_output) + residual
@@ -211,27 +214,27 @@ class SelfAttention(nn.Module):
         hidden_dim = heads * head_dim
 
         # use AdaRMSNorm if time_emb_dim is provided, otherwise use RMSNorm
-        if time_emb_dim is not None:
-            self.norm = AdaRMSNorm(in_channels, in_channels, time_emb_dim)
-        else:
-            self.norm = RMSNorm(in_channels, scale=1.0)
+        # if time_emb_dim is not None:
+        #     self.norm = AdaRMSNorm(in_channels, time_emb_dim)
+        # else:
+        #     self.norm = RMSNorm(in_channels, self.scale)
 
         self.qkv = nn.Conv2d(in_channels, hidden_dim * 3, kernel_size=1, bias=False )
         self.output = nn.Sequential(
             ## MODIFY ##
             nn.Conv2d(hidden_dim, in_channels, kernel_size = 1),
-            RMSNorm(in_channels, scale = 1.0)
+            RMSNorm(in_channels, self.scale)
         )
     
     def forward(self, x: Tensor, time_emb: Tensor = None) -> Tensor:
         residual = x
         b, c, h, w = x.shape
-        if time_emb is not None:
-            x_norm = self.norm(x, time_emb)
-        else:
-            x_norm = self.norm(x)
+        # if time_emb is not None:
+        #     x_norm = self.norm(x, time_emb)
+        # else:
+        #     x_norm = self.norm(x)
 
-        qkv = self.qkv(x_norm)
+        qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=1)
 
         q = rearrange(q, 'b (h c) l w -> b h c (l w)', h=self.heads)
@@ -241,19 +244,68 @@ class SelfAttention(nn.Module):
 
         # attention formula: softmax(QK^T / sqrt(d_k))V
         q = q * self.scale
-        sim = torch.einsum('b h c lw1, b h c lw2 -> b h lw1 lw2', q, k)
+        sim = torch.einsum('b h c i, b h c j -> b h i j', q, k)
         sim = sim - sim.amax(dim=-1, keepdim=True).detach()
         attn = sim.softmax(dim=-1)
 
         # attn_output = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
 
         # (batch, heads, channels, length + width)
-        attn_output = torch.einsum('b h lw1 lw2, b h c lw2 -> b h lw1 c', attn, v)
+        attn_output = torch.einsum('b h i j, b h c j -> b h i c', attn, v)
 
         attn_output = rearrange(attn_output, 'b h (l w) c -> b (h c) l w', l=h, w=w)
         return self.output(attn_output) + residual
+    
+class GEGLU(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self._to_x_gate= nn.Linear(in_channels, out_channels * 2)
 
+    def forward(self, x: Tensor) -> Tensor:
+        x_gate = self._to_x_gate(x)
+        x, gate = x_gate.chunk(2, dim=-1)
+        return x * F.gelu(gate)
+    
+class FeedForward(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        inner_dim = out_channels * 4
+        self.ff = nn.Sequential(
+            #nn.Linear(in_channels, out_channels),
+            GEGLU(in_channels, inner_dim),
+            nn.Linear(inner_dim, in_channels)
+        )
 
+    def forward(self, x: Tensor) -> Tensor:
+        return self.ff(x)
+    
+class TransformerBlock(nn.Module):
+    def __init__(self, in_channels: int, heads: int, head_dim: int, context_dim: int, time_emb_dim: int = None):
+        super().__init__()
+
+        # Attention modules
+        self.self_attn = SelfAttention(in_channels, heads, head_dim, time_emb_dim)
+        self.cross_attn = CrossAttention(in_channels, context_dim, heads, head_dim, time_emb_dim)
+
+        # Norm depending on time_emb
+        if time_emb_dim is not None:
+            self.norm1 = AdaRMSNorm(in_channels, time_emb_dim)
+            self.norm2 = AdaRMSNorm(in_channels, time_emb_dim)
+            self.norm3 = AdaRMSNorm(in_channels, time_emb_dim)
+        else:
+            self.norm1 = RMSNorm(in_channels)
+            self.norm2 = RMSNorm(in_channels)
+            self.norm3 = RMSNorm(in_channels)
+
+        self.context_norm = nn.LayerNorm(context_dim)
+        #FF block
+        self.ff = FeedForward(in_channels, in_channels)
+
+    def forward(self, x: Tensor, context: Tensor, time_emb: Tensor = None) -> Tensor:
+        #residual = x
+        x = self.self_attn(self.norm1(x, time_emb), time_emb) + x
+        x = self.cross_attn(self.norm2(x, time_emb), self.context_norm(context), time_emb) + x
+        return self.ff(self.norm3(x, time_emb)) + x
 
 class UNet(nn.Module):
     def __init__(self, in_channels: int = 3, heads: int = 4, dim_head: int = 32, time_emb_dim: int = 128, out_channels: int = 3):
@@ -266,59 +318,60 @@ class UNet(nn.Module):
             nn.Linear(time_emb_dim, time_emb_dim)
         )
 
-        self.input_layer = nn.Conv2d(in_channels, 32, kernel_size=1)
+        self.input_layer = nn.Conv2d(in_channels, 64, kernel_size=1)
 
         self.downs = nn.ModuleList([
             nn.ModuleList([
-                ResBlock(32, 32, time_emb_dim),
-                ResBlock(32, 32, time_emb_dim),
-                CrossAttention(32, context_dim=128, heads=heads, head_dim=dim_head, time_emb_dim=time_emb_dim),
-                DownBlockStride(32, 32)
-            ]),
-
-            nn.ModuleList([
-                ResBlock(32, 64, time_emb_dim),
                 ResBlock(64, 64, time_emb_dim),
-                CrossAttention(64, context_dim=128, heads=heads, head_dim=dim_head, time_emb_dim=time_emb_dim),
+                ResBlock(64, 64, time_emb_dim),
+                TransformerBlock(64, heads, dim_head, 128, time_emb_dim),
                 DownBlockStride(64, 64)
             ]),
 
             nn.ModuleList([
-                ResBlock(64, 128, time_emb_dim),
-                ResBlock(128, 128, time_emb_dim),
-                CrossAttention(128, context_dim=128, heads=heads, head_dim=dim_head, time_emb_dim=time_emb_dim),
-                DownBlockStride(128, 128)
+                ResBlock(64, 64, time_emb_dim),
+                ResBlock(64, 64, time_emb_dim),
+                TransformerBlock(64, heads, dim_head, 128, time_emb_dim),
+                DownBlockStride(64, 64)
+            ]),
+
+            nn.ModuleList([
+                ResBlock(64, 64, time_emb_dim),
+                ResBlock(64, 64, time_emb_dim),
+                TransformerBlock(64, heads, dim_head, 128, time_emb_dim),
+                DownBlockStride(64, 128)
             ])
         ])
 
         self.mid_block1 = ResBlock(128, 128, time_emb_dim)
-        self.mid_attention = SelfAttention(128, heads, dim_head, time_emb_dim)
+        self.mid_transform = TransformerBlock(128, heads, dim_head, 128, time_emb_dim)
+        #self.mid_attention = SelfAttention(128, heads, dim_head, time_emb_dim)
         self.mid_block2 = ResBlock(128, 128, time_emb_dim)
 
         self.ups = nn.ModuleList([
             nn.ModuleList([
-                UpBlock(256, 128),
-                ResBlock(256, 128, time_emb_dim),
-                ResBlock(128, 128, time_emb_dim),
-                CrossAttention(128, context_dim=128, heads=heads, head_dim=dim_head, time_emb_dim=time_emb_dim)
+                ResBlock(128 + 64, 128, time_emb_dim),
+                ResBlock(128 + 64, 128, time_emb_dim),
+                TransformerBlock(128, heads, dim_head, 128, time_emb_dim),
+                UpBlock(128, 64)
             ]),
 
             nn.ModuleList([
-                UpBlock(256, 64),
-                ResBlock(128 + 64, 64, time_emb_dim),
-                ResBlock(64, 64, time_emb_dim),
-                CrossAttention(64, context_dim=128, heads=heads, head_dim=dim_head, time_emb_dim=time_emb_dim)
+                ResBlock(64 + 32, 64, time_emb_dim),
+                ResBlock(64 + 32, 64, time_emb_dim),
+                TransformerBlock(64, heads, dim_head, 128, time_emb_dim),
+                UpBlock(64, 32)
             ]),
 
             nn.ModuleList([
-                UpBlock(128 + 64, 32),
-                ResBlock(96, 32, time_emb_dim),
-                ResBlock(32, 32, time_emb_dim),
-                CrossAttention(32, context_dim=128, heads=heads, head_dim=dim_head, time_emb_dim=time_emb_dim)
+                ResBlock(32 + 32, 32, time_emb_dim),
+                ResBlock(32 + 32, 32, time_emb_dim),
+                TransformerBlock(32, heads, dim_head, 128, time_emb_dim),
+                nn.Conv2d(32, 32, kernel_size=3, padding=1)
             ])
         ])
 
-        self.output_res = ResBlock(32, 32, time_emb_dim)
+        self.output_res = ResBlock(32 + 32, 32, time_emb_dim)
         self.output_layer = nn.Conv2d(32, out_channels, kernel_size=1)  
 
     def forward(self, x: Tensor, time_steps: Tensor, context: Tensor) -> Tensor:
@@ -330,24 +383,75 @@ class UNet(nn.Module):
 
         residuals = []
 
-        for res1, res2, attn, down in self.downs:
+        for res1, res2, transform, down in self.downs:
             y = res1(y, time_emb)
             residuals.append(y)
             y = res2(y, time_emb)
-            y = attn(y, context)  + y
+            y = transform(y, context, time_emb)
             residuals.append(y)
             y = down(y)
 
         y = self.mid_block1(y, time_emb)
-        y = self.mid_attention(y, time_emb) + y
-        y = self.mid_block2(y, time_emb)
+        y = self.mid_transform(y, context, time_emb)
+        y = self.mid_block2(y, time_emb)    
 
-        for res1, res2, attn, up in self.ups:
+        for res1, res2, transform, up in self.ups:
             y = res1(torch.cat((y, residuals.pop()), dim=1), time_emb)
             y = res2(torch.cat((y, residuals.pop()), dim=1), time_emb)
-            y = attn(y, context) + y
+            y = transform(y, context, time_emb)
             y = up(y)
 
         y = self.output_res(torch.cat((y, r), dim=1), time_emb)
         y = self.output_layer(y)
         return y
+    
+if __name__ == "__main__":
+    import torch
+
+    # 1. Setup Configuration
+    BATCH_SIZE = 2
+    IMG_SIZE = 64        # We test with 64x64 images
+    IN_CHANNELS = 3
+    OUT_CHANNELS = 3
+    TIME_EMB_DIM = 128
+    CONTEXT_DIM = 128    # Matching the '128' passed to TransformerBlock in your UNet
+
+    # 2. Instantiate Model
+    print("Initializing U-Net...")
+    model = UNet(
+        in_channels=IN_CHANNELS,
+        heads=4,
+        dim_head=32,
+        time_emb_dim=TIME_EMB_DIM,
+        out_channels=OUT_CHANNELS
+    )
+
+    # 3. Create Dummy Data
+    # x: (Batch, Channels, Height, Width)
+    x = torch.randn(BATCH_SIZE, IN_CHANNELS, IMG_SIZE, IMG_SIZE)
+    
+    # time_steps: (Batch,) - Random integers representing timesteps
+    t = torch.randint(0, 1000, (BATCH_SIZE,))
+    
+    # context: (Batch, Seq_Len, Dim) - e.g., 77 tokens for CLIP
+    # Note: Sequence length (77) doesn't matter for CrossAttn, but Dim (128) must match
+    context = torch.randn(BATCH_SIZE, 77, CONTEXT_DIM)
+
+    # 4. Run Forward Pass
+    print(f"Input Shape: {x.shape}")
+    print("Running forward pass...")
+    
+    try:
+        y = model(x, t, context)
+        print(f"Output Shape: {y.shape}")
+        
+        # 5. Verify Output
+        if y.shape == (BATCH_SIZE, OUT_CHANNELS, IMG_SIZE, IMG_SIZE):
+            print("\n✅ SUCCESS: Shapes match perfectly!")
+        else:
+            print(f"\n❌ FAILURE: Output shape mismatch. Expected {(BATCH_SIZE, OUT_CHANNELS, IMG_SIZE, IMG_SIZE)}, got {y.shape}")
+
+    except RuntimeError as e:
+        print("\n❌ CRASHED during forward pass.")
+        print(f"Error: {e}")
+        print("Tip: If the error says 'Sizes of tensors must match', check your ResBlock in_channels configuration.")

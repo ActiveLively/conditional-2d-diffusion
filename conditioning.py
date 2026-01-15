@@ -27,12 +27,21 @@ class TimeEmbedding(nn.Module):
 
 # Image Conditioning Module
 # input ViT features and output conditioning features for the unet model
-class ImageConditioning(nn.Module):
-
+class LeNet5(nn.Module):
     def __init__(self, in_channels: int, cond_channels: int):
         super().__init__()
-        
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.linear1 = nn.Linear(128 * 8 * 8, 256)
+        self.linear2 = nn.Linear(256, cond_channels)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.relu = nn.ReLU()
 
-    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.pool(self.relu(self.conv1(x)))
+        x = self.pool(self.relu(self.conv2(x)))
 
-    
+        x = x.view(x.size(0), -1)
+        x = self.relu(self.linear1(x))
+        x = self.linear2(x)
+        return x
