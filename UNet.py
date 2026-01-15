@@ -383,7 +383,7 @@ class UNet(nn.Module):
         self.output_res = ResBlock(32 + 32, 32, time_emb_dim)
         self.output_layer = nn.Conv2d(32, out_channels, kernel_size=1)  
 
-    def forward(self, x: Tensor, time_steps: Tensor, context: Tensor) -> Tensor:
+    def forward(self, x: Tensor,  time_steps: Tensor, context: Tensor,) -> Tensor:
         b, c, l, w = x.shape
         time_emb = self.tim_mlp(time_steps)
 
@@ -394,85 +394,34 @@ class UNet(nn.Module):
 
         for res1, res2, transform, down in self.downs:
             y = res1(y, time_emb)
-            print("after res1: ", y.shape)
+            # print("after res1: ", y.shape)
             residuals.append(y)
-            y = res2(y, time_emb)
-            print("after res2: ", y.shape)
+            # y = res2(y, time_emb)
+            # print("after res2: ", y.shape)
             y = transform(y, context, time_emb)
-            print("after transform: ", y.shape)
+            # print("after transform: ", y.shape)
             residuals.append(y)
             y = down(y)
-            print("after down: ", y.shape)
+            # print("after down: ", y.shape)
 
         y = self.mid_block1(y, time_emb)
-        print("after mid block 1: ", y.shape)
+        # print("after mid block 1: ", y.shape)
         y = self.mid_transform(y, context, time_emb)
-        print("after mid transform: ", y.shape)
+        # print("after mid transform: ", y.shape)
         y = self.mid_block2(y, time_emb)    
-        print("after mid block 2: ", y.shape)
+        # print("after mid block 2: ", y.shape)
 
         for res1, res2, transform, up in self.ups:
             y = res1(torch.cat((y, residuals.pop()), dim=1), time_emb)
-            print("after res1 up: ", y.shape)
+            # print("after res1 up: ", y.shape)
             y = res2(torch.cat((y, residuals.pop()), dim=1), time_emb)
-            print("after res2 up: ", y.shape)
+            # print("after res2 up: ", y.shape)
             y = transform(y, context, time_emb)
-            print("after transform up: ", y.shape)
+            # print("after transform up: ", y.shape)
             y = up(y)
-            print("after up: ", y.shape)
+            # print("after up: ", y.shape)
             
 
         y = self.output_res(torch.cat((y, r), dim=1), time_emb)
         y = self.output_layer(y)
         return y
-    
-if __name__ == "__main__":
-    import torch
-
-    # 1. Setup Configuration
-    BATCH_SIZE = 2
-    IMG_SIZE = 64        # We test with 64x64 images
-    IN_CHANNELS = 3
-    OUT_CHANNELS = 3
-    TIME_EMB_DIM = 128
-    CONTEXT_DIM = 128    # Matching the '128' passed to TransformerBlock in your UNet
-
-    # 2. Instantiate Model
-    print("Initializing U-Net...")
-    model = UNet(
-        in_channels=IN_CHANNELS,
-        heads=4,
-        dim_head=32,
-        time_emb_dim=TIME_EMB_DIM,
-        out_channels=OUT_CHANNELS
-    )
-
-    # 3. Create Dummy Data
-    # x: (Batch, Channels, Height, Width)
-    x = torch.randn(BATCH_SIZE, IN_CHANNELS, IMG_SIZE, IMG_SIZE)
-    
-    # time_steps: (Batch,) - Random integers representing timesteps
-    t = torch.randint(0, 1000, (BATCH_SIZE,))
-    
-    # context: (Batch, Seq_Len, Dim) - e.g., 77 tokens for CLIP
-    # Note: Sequence length (77) doesn't matter for CrossAttn, but Dim (128) must match
-    context = torch.randn(BATCH_SIZE, 77, CONTEXT_DIM)
-
-    # 4. Run Forward Pass
-    print(f"Input Shape: {x.shape}")
-    print("Running forward pass...")
-    
-    try:
-        y = model(x, t, context)
-        print(f"Output Shape: {y.shape}")
-        
-        # 5. Verify Output
-        if y.shape == (BATCH_SIZE, OUT_CHANNELS, IMG_SIZE, IMG_SIZE):
-            print("\n✅ SUCCESS: Shapes match perfectly!")
-        else:
-            print(f"\n❌ FAILURE: Output shape mismatch. Expected {(BATCH_SIZE, OUT_CHANNELS, IMG_SIZE, IMG_SIZE)}, got {y.shape}")
-
-    except RuntimeError as e:
-        print("\n❌ CRASHED during forward pass.")
-        print(f"Error: {e}")
-        print("Tip: If the error says 'Sizes of tensors must match', check your ResBlock in_channels configuration.")

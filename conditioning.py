@@ -1,6 +1,8 @@
+from tkinter import Image
 import torch
 from torch import Tensor
 import torch.nn as nn
+from torchvision import datasets, transforms
 
 # Sinusoidal Time Embedding Module
 
@@ -45,3 +47,19 @@ class LeNet5(nn.Module):
         x = self.relu(self.linear1(x))
         x = self.linear2(x)
         return x
+    
+def get_image_condition(file_path: str, condition_channels: int, device = 'cpu'):
+    transform = transforms.Compose([
+        transforms.Resize((32,32)), 
+        transforms.ToTensor()
+    ])
+    img = Image.open(file_path).convert('L')
+    img_resized = transform(img).unsqueeze(0).to(device)
+    lenet5 = LeNet5(in_channels = 1, cond_channels = condition_channels).to(device)
+    lenet5.to(device)
+    lenet5.eval()
+
+    with torch.no_grad():
+        context = lenet5(img_resized)
+
+    return context, context.shape 

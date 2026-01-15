@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from UNet import UNET
+from UNet import UNet
 
 
 def add_singletons_like(v: Tensor, x_shape: tuple) -> Tensor:
@@ -91,7 +91,7 @@ class DiffusionSampler(nn.Module):
         return xt, noise
     
     @torch.no_grad()
-    def p_sample(self, model: nn.Module, xt: Tensor, t: Tensor) -> Tensor:
+    def p_sample(self, model: nn.Module, xt: Tensor, t: Tensor, context: Tensor) -> Tensor:
         beta               = extract(self.beta, t, xt.shape)
         alpha              = extract(self.alpha, t, xt.shape)
         alpha_bar          = extract(self.alpha_bar, t, xt.shape)
@@ -105,7 +105,7 @@ class DiffusionSampler(nn.Module):
 
         Also see Algorithm (2) Sampling
         '''
-        mu = torch.divide(1.0, torch.sqrt(alpha)) * (xt - torch.divide(beta, torch.sqrt(1.0-alpha_bar)) *  model(xt, t))
+        mu = torch.divide(1.0, torch.sqrt(alpha)) * (xt - torch.divide(beta, torch.sqrt(1.0-alpha_bar)) *  model(xt, t, context))
         beta_tilda = torch.divide( (1.0 - alpha_bar_prev), (1.0 - alpha_bar)) * beta
         noise = torch.randn_like(xt)
         sample = mu + torch.sqrt(beta_tilda) * not_first_timestep * noise
@@ -113,7 +113,7 @@ class DiffusionSampler(nn.Module):
         return sample
     
     @torch.no_grad()
-    def p_sample_loop(self, model: nn.Module, xT: Tensor, num_images: int = 1) -> Tensor:
+    def p_sample_loop(self, model: nn.Module, xT: Tensor, context: Tensor, num_images: int = 1) -> Tensor:
 
         xt = xT.clone()
 
@@ -124,7 +124,7 @@ class DiffusionSampler(nn.Module):
 
         for i in reversed(range(self.timesteps)):
             t = torch.ones(xT.shape[0], device = xT.device).long() * i
-            xt = self.p_sample(model, xt, t)
+            xt = self.p_sample(model, xt, t, context)
 
             if num_images > 1 and (i % dt == 0 or i == self.timesteps - 1):
                 sequence.append(xt)
