@@ -1,0 +1,8 @@
+name: conditional-2d-diffusion
+channels:
+  - conda-forge
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - python=3.12
+prefix: /opt/miniconda3/envs/conditional-2d-diffusion
