@@ -3,6 +3,7 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 from torchvision import datasets, transforms
+import torchvision.transforms.functional as TF
 
 # Sinusoidal Time Embedding Module
 
@@ -49,11 +50,21 @@ class LeNet5(nn.Module):
         return x
     
 def get_image_condition(file_path: str, model, condition_channels: int, device = 'cpu'):
+    
+    img = Image.open(file_path).convert('L')
+    if TF.to_tensor(img).mean() > 0.5:
+        img = TF.invert(img)
+
+    # thereshold image color intesnities
+    fn = lambda x : 255 if x > 80 else 0
+    img = img.point(fn, mode='1')
+
     transform = transforms.Compose([
         transforms.Resize((32,32)), 
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x * 2 - 1)  # [0,1] -> [-1,1]
     ])
-    img = Image.open(file_path).convert('L')
+
     img_resized = transform(img).unsqueeze(0).to(device)
     model.eval()
 

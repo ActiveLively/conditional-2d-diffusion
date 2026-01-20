@@ -28,7 +28,7 @@ if __name__ == '__main__':
     h_size = 128
     timesteps = 1000
     batch_size = 64
-    steps = 10000
+    steps = 100000
     beta_schedule = 'cosine'
 
     condition_channels = 128

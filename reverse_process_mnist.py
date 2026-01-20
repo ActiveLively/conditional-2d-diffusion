@@ -42,7 +42,7 @@ if __name__ == '__main__':
     lenet_embedder.load_state_dict(checkpoints['embedder'])
 
     context, context_shape = get_image_condition(
-        './context_imgs/cond_diff_context_6.JPG', 
+        './context_imgs/cond_diff_context_6.jpg', 
         lenet_embedder, 
         condition_channels = 128, 
         device = device
@@ -81,7 +81,7 @@ if __name__ == '__main__':
         print(i)
 
     fig.tight_layout()
-    fig.savefig(f'mnist_reverse_process_{timesteps}steps_long.png', dpi = 300)
+    fig.savefig(f'mnist_reverse_process_{timesteps}steps_long_context_6.png', dpi = 300)
 
 
     
