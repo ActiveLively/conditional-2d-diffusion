@@ -31,18 +31,19 @@ if __name__ == '__main__':
     x0 = img.permute(1, 2, 0).unsqueeze(0).float()
 
     timesteps = 1000
+    input_steps = 50000
     cosine_sampler = DiffusionSampler(timesteps, 'cosine').to(device)
     # linear_sampler = DiffusionSampler(timesteps, 'scaled_linear').to(device)
 
     ##########set UNet + LeNet5 model
     unet_cosine = UNet(in_channels=1, out_channels=1).to(device)
     lenet_embedder = LeNet5(in_channels=1, cond_channels=128).to(device)
-    checkpoints = torch.load('models/model_UNet_cosine_1000timesteps_64batch_10000steps.pt', map_location=device)
+    checkpoints = torch.load(f'models/model_UNet_cosine_{timesteps}timesteps_64batch_{input_steps}steps.pt', map_location=device)
     unet_cosine.load_state_dict(checkpoints['unet'])
     lenet_embedder.load_state_dict(checkpoints['embedder'])
 
     context, context_shape = get_image_condition(
-        './context_imgs/cond_diff_context_6.jpg', 
+        './context_imgs/cond_diff_mnist_4.jpg', 
         lenet_embedder, 
         condition_channels = 128, 
         device = device
@@ -81,7 +82,7 @@ if __name__ == '__main__':
         print(i)
 
     fig.tight_layout()
-    fig.savefig(f'mnist_reverse_process_{timesteps}steps_long_context_6.png', dpi = 300)
+    fig.savefig(f'mnist_reverse_process_{timesteps}timesteps_{input_steps}steps_mnist_4.png', dpi = 300)
 
 
     
